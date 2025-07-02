@@ -1,49 +1,117 @@
 // server.js
 
-// 1. เรียกใช้ 'net' ซึ่งเป็นโมดูลสำหรับสร้างระบบเครือข่าย TCP ของ Node.js
 const net = require('net');
+const mysql = require('mysql2/promise'); // <-- ใช้ mysql2
+const bcrypt = require('bcryptjs'); // <-- ใช้ bcryptjs
 
-// 2. สร้างอาร์เรย์ (ลิสต์) ว่างๆ เพื่อเอาไว้เก็บรายชื่อ client ที่เชื่อมต่อเข้ามา
+// --- การตั้งค่าการเชื่อมต่อฐานข้อมูล ---
+// (ใส่รหัสผ่านที่คุณตั้งไว้ในขั้นตอนที่ 5.2)
+const dbConfig = {
+    host: 'localhost',
+    user: 'tcg_user',
+    password: 'W@rasit686', // <-- ใส่รหัสผ่าน DB ของคุณตรงนี้
+    database: 'tcg_db'
+};
+
+// สร้าง pool การเชื่อมต่อเพื่อประสิทธิภาพที่ดีกว่า
+const dbPool = mysql.createPool(dbConfig);
+
+
+// --- ส่วนจัดการการเชื่อมต่อของผู้เล่น (เหมือนเดิม) ---
 const clients = [];
 
-// 3. สร้าง Server ขึ้นมา
 const server = net.createServer(socket => {
-    // โค้ดในนี้จะทำงานทุกครั้งที่มี Client ใหม่เชื่อมต่อเข้ามาสำเร็จ
-    // 'socket' คือตัวแทนของ Client คนนั้นๆ
-
     console.log('มี Client ใหม่เชื่อมต่อเข้ามา!');
-
-    // เพิ่ม Client ที่เพิ่งเชื่อมต่อเข้ามาเก็บไว้ในลิสต์
     clients.push(socket);
 
-    // 4. เมื่อ Server ได้รับข้อมูลจาก Client คนนี้
+    // เมื่อได้รับข้อมูลจาก Client
     socket.on('data', data => {
-        console.log('ได้รับข้อมูลจาก Client:', data.toString());
+        // ลองแปลงข้อมูลที่ได้รับเป็น JSON
+        try {
+            const message = JSON.parse(data.toString());
 
-        // 5. ส่งข้อมูลที่ได้รับไปให้ Client "ทุกคน" ที่อยู่ในลิสต์
-        clients.forEach(client => {
-            // เช็คว่า Client ในลิสต์ไม่ใช่คนเดียวกับที่ส่งข้อมูลมา
-            if (client !== socket) {
-                client.write(data);
+            // ตรวจสอบว่า Client ต้องการทำอะไร
+            if (message.action === 'register') {
+                handleRegister(socket, message.payload);
+            } else {
+                // ถ้าไม่ใช่คำสั่งที่รู้จัก ก็ส่งต่อข้อมูลแบบเดิม (สำหรับเกม)
+                broadcast(data, socket);
             }
-        });
+
+        } catch (error) {
+            // ถ้าข้อมูลไม่ใช่ JSON (เป็นข้อมูลเกม) ให้ส่งต่อเลย
+            console.log('ได้รับข้อมูลเกม (Game Packet)');
+            broadcast(data, socket);
+        }
     });
 
-    // 6. เมื่อ Client คนนี้ตัดการเชื่อมต่อ
     socket.on('close', () => {
         console.log('Client ตัดการเชื่อมต่อ');
-        // ลบ Client คนที่ออกไปแล้วออกจากลิสต์
         clients.splice(clients.indexOf(socket), 1);
     });
 
-    // จัดการ Error (หากมี)
     socket.on('error', err => {
         console.error('Client เกิดข้อผิดพลาด:', err.message);
     });
 });
 
-// 7. สั่งให้ Server เริ่มทำงานและรอการเชื่อมต่อที่ Port 8080
+// ฟังก์ชันสำหรับส่งข้อมูลไปให้ทุกคน ยกเว้นคนส่ง
+function broadcast(data, senderSocket) {
+    clients.forEach(client => {
+        if (client !== senderSocket) {
+            client.write(data);
+        }
+    });
+}
+
+// --- ฟังก์ชันใหม่: จัดการการลงทะเบียน ---
+async function handleRegister(socket, payload) {
+    const { username, email, password } = payload;
+
+    // ตรวจสอบข้อมูลเบื้องต้น
+    if (!username || !email || !password) {
+        return socket.write(JSON.stringify({ status: 'error', message: 'กรุณากรอกข้อมูลให้ครบถ้วน' }));
+    }
+
+    try {
+        // เข้ารหัสรหัสผ่าน
+        const hashedPassword = await bcrypt.hash(password, 10); // 10 คือค่าความซับซ้อน
+
+        // เพิ่มผู้ใช้ใหม่ลงในฐานข้อมูล
+        const [result] = await dbPool.execute(
+            'INSERT INTO users (username, email, password) VALUES (?, ?, ?)',
+            [username, email, hashedPassword]
+        );
+
+        console.log(`ผู้ใช้ใหม่ลงทะเบียนสำเร็จ: ${username} (ID: ${result.insertId})`);
+
+        // ส่งข้อความกลับไปบอก Client ว่าสำเร็จ
+        socket.write(JSON.stringify({ status: 'success', message: 'ลงทะเบียนสำเร็จ!' }));
+
+    } catch (dbError) {
+        console.error('เกิดข้อผิดพลาดกับฐานข้อมูล:', dbError.message);
+
+        // เช็คว่าชื่อผู้ใช้หรืออีเมลซ้ำหรือไม่
+        if (dbError.code === 'ER_DUP_ENTRY') {
+            socket.write(JSON.stringify({ status: 'error', message: 'ชื่อผู้ใช้หรืออีเมลนี้มีอยู่ในระบบแล้ว' }));
+        } else {
+            socket.write(JSON.stringify({ status: 'error', message: 'เกิดข้อผิดพลาดในการลงทะเบียน' }));
+        }
+    }
+}
+
+
+// --- สั่งให้ Server เริ่มทำงาน (เหมือนเดิม) ---
 const PORT = 8080;
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
+    // ทดสอบการเชื่อมต่อฐานข้อมูลเมื่อ Server เริ่มทำงาน
+    try {
+        const connection = await dbPool.getConnection();
+        console.log('เชื่อมต่อฐานข้อมูล MySQL สำเร็จ!');
+        connection.release(); // คืนการเชื่อมต่อกลับสู่ pool
+    } catch (err) {
+        console.error('ไม่สามารถเชื่อมต่อฐานข้อมูลได้:', err.message);
+        process.exit(1); // ปิด Server ถ้าต่อ DB ไม่ได้
+    }
     console.log(`Server กำลังรอการเชื่อมต่อที่ Port ${PORT}`);
 });
